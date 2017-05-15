@@ -78,4 +78,10 @@ OPTIONS
 -version::
   Outputs the version of the influx client.
 
+-destination-database::
+  Overrides the database name found in the import file and sets it to the specified value, must be used with -import.
+
+-retention-policy::
+  Overrides the retention policy when importing a databse from file. must be used with -import.
+
 include::footer.txt[]
