@@ -9,11 +9,14 @@ import (
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/estimator"
+	"github.com/influxdata/influxdb/query"
+	"github.com/uber-go/zap"
 )
 
 type Index interface {
 	Open() error
 	Close() error
+	WithLogger(zap.Logger)
 
 	MeasurementExists(name []byte) (bool, error)
 	MeasurementNamesByExpr(expr influxql.Expr) ([][]byte, error)
@@ -31,15 +34,16 @@ type Index interface {
 	SeriesN() int64
 
 	HasTagKey(name, key []byte) (bool, error)
-	TagSets(name []byte, options influxql.IteratorOptions) ([]*influxql.TagSet, error)
+	TagSets(name []byte, options query.IteratorOptions) ([]*query.TagSet, error)
 	MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[string]struct{}, error)
+	MeasurementTagKeyValuesByExpr(name []byte, keys []string, expr influxql.Expr, keysSorted bool) ([][]string, error)
+
 	ForEachMeasurementTagKey(name []byte, fn func(key []byte) error) error
 	TagKeyCardinality(name, key []byte) int
 
 	// InfluxQL system iterators
 	MeasurementSeriesKeysByExpr(name []byte, condition influxql.Expr) ([][]byte, error)
-	ForEachMeasurementSeriesByExpr(name []byte, expr influxql.Expr, fn func(tags models.Tags) error) error
-	SeriesPointIterator(opt influxql.IteratorOptions) (influxql.Iterator, error)
+	SeriesPointIterator(opt query.IteratorOptions) (query.Iterator, error)
 
 	// Sets a shared fieldset from the engine.
 	SetFieldSet(fs *MeasurementFieldSet)
@@ -68,7 +72,7 @@ const (
 )
 
 // NewIndexFunc creates a new index.
-type NewIndexFunc func(id uint64, path string, options EngineOptions) Index
+type NewIndexFunc func(id uint64, database, path string, options EngineOptions) Index
 
 // newIndexFuncs is a lookup of index constructors by name.
 var newIndexFuncs = make(map[string]NewIndexFunc)
@@ -93,7 +97,7 @@ func RegisteredIndexes() []string {
 
 // NewIndex returns an instance of an index based on its format.
 // If the path does not exist then the DefaultFormat is used.
-func NewIndex(id uint64, path string, options EngineOptions) (Index, error) {
+func NewIndex(id uint64, database, path string, options EngineOptions) (Index, error) {
 	format := options.IndexVersion
 
 	// Use default format unless existing directory exists.
@@ -111,11 +115,11 @@ func NewIndex(id uint64, path string, options EngineOptions) (Index, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("invalid index format: %q", format)
 	}
-	return fn(id, path, options), nil
+	return fn(id, database, path, options), nil
 }
 
-func MustOpenIndex(id uint64, path string, options EngineOptions) Index {
-	idx, err := NewIndex(id, path, options)
+func MustOpenIndex(id uint64, database, path string, options EngineOptions) Index {
+	idx, err := NewIndex(id, database, path, options)
 	if err != nil {
 		panic(err)
 	} else if err := idx.Open(); err != nil {

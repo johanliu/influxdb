@@ -6,17 +6,24 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
 	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/internal"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/prometheus/remote"
+	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/services/httpd"
 	"github.com/influxdata/influxdb/services/meta"
 )
@@ -24,14 +31,14 @@ import (
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_Query(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if stmt.String() != `SELECT * FROM bar` {
 			t.Fatalf("unexpected query: %s", stmt.String())
 		} else if ctx.Database != `foo` {
 			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
@@ -47,14 +54,14 @@ func TestHandler_Query(t *testing.T) {
 // Ensure the handler returns results from a query passed as a file.
 func TestHandler_Query_File(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if stmt.String() != `SELECT * FROM bar` {
 			t.Fatalf("unexpected query: %s", stmt.String())
 		} else if ctx.Database != `foo` {
 			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
@@ -90,7 +97,7 @@ func TestHandler_Query_Auth(t *testing.T) {
 	// Set mock meta client functions for the handler to use.
 	h.MetaClient.AdminUserExistsFn = func() bool { return true }
 
-	h.MetaClient.UserFn = func(username string) (*meta.UserInfo, error) {
+	h.MetaClient.UserFn = func(username string) (meta.User, error) {
 		if username != "user1" {
 			return nil, meta.ErrUserNotFound
 		}
@@ -101,7 +108,7 @@ func TestHandler_Query_Auth(t *testing.T) {
 		}, nil
 	}
 
-	h.MetaClient.AuthenticateFn = func(u, p string) (*meta.UserInfo, error) {
+	h.MetaClient.AuthenticateFn = func(u, p string) (meta.User, error) {
 		if u != "user1" {
 			return nil, fmt.Errorf("unexpected user: exp: user1, got: %s", u)
 		} else if p != "abcd" {
@@ -111,25 +118,36 @@ func TestHandler_Query_Auth(t *testing.T) {
 	}
 
 	// Set mock query authorizer for handler to use.
-	h.QueryAuthorizer.AuthorizeQueryFn = func(u *meta.UserInfo, query *influxql.Query, database string) error {
+	h.QueryAuthorizer.AuthorizeQueryFn = func(u meta.User, query *influxql.Query, database string) error {
 		return nil
 	}
 
 	// Set mock statement executor for handler to use.
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if stmt.String() != `SELECT * FROM bar` {
 			t.Fatalf("unexpected query: %s", stmt.String())
 		} else if ctx.Database != `foo` {
 			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
 	// Test the handler with valid user and password in the URL parameters.
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, MustNewJSONRequest("GET", "/query?u=user1&p=abcd&db=foo&q=SELECT+*+FROM+bar", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if body := strings.TrimSpace(w.Body.String()); body != `{"results":[{"statement_id":1,"series":[{"name":"series0"}]},{"statement_id":2,"series":[{"name":"series1"}]}]}` {
+		t.Fatalf("unexpected body: %s", body)
+	}
+
+	// Test the handler with valid user and password using basic auth.
+	w = httptest.NewRecorder()
+	r := MustNewJSONRequest("GET", "/query?db=foo&q=SELECT+*+FROM+bar", nil)
+	r.SetBasicAuth("user1", "abcd")
+	h.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
 	} else if body := strings.TrimSpace(w.Body.String()); body != `{"results":[{"statement_id":1,"series":[{"name":"series0"}]},{"statement_id":2,"series":[{"name":"series1"}]}]}` {
@@ -203,12 +221,24 @@ func TestHandler_Query_Auth(t *testing.T) {
 	} else if body := strings.TrimSpace(w.Body.String()); body != `{"error":"token expiration required"}` {
 		t.Fatalf("unexpected body: %s", body)
 	}
+
+	// Test the handler with valid user and password in the url and invalid in
+	// basic auth (prioritize url).
+	w = httptest.NewRecorder()
+	r = MustNewJSONRequest("GET", "/query?u=user1&p=abcd&db=foo&q=SELECT+*+FROM+bar", nil)
+	r.SetBasicAuth("user1", "efgh")
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d: %s", w.Code, w.Body.String())
+	} else if body := strings.TrimSpace(w.Body.String()); body != `{"results":[{"statement_id":1,"series":[{"name":"series0"}]},{"statement_id":2,"series":[{"name":"series1"}]}]}` {
+		t.Fatalf("unexpected body: %s", body)
+	}
 }
 
 // Ensure the handler returns results from a query (including nil results).
 func TestHandler_QueryRegex(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if stmt.String() != `SELECT * FROM test WHERE url =~ /http\:\/\/www.akamai\.com/` {
 			t.Fatalf("unexpected query: %s", stmt.String())
 		} else if ctx.Database != `test` {
@@ -225,9 +255,9 @@ func TestHandler_QueryRegex(t *testing.T) {
 // Ensure the handler merges results from the same statement.
 func TestHandler_Query_MergeResults(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
@@ -243,9 +273,9 @@ func TestHandler_Query_MergeResults(t *testing.T) {
 // Ensure the handler merges results from the same statement.
 func TestHandler_Query_MergeEmptyResults(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows{}}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows{}}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
@@ -261,12 +291,12 @@ func TestHandler_Query_MergeEmptyResults(t *testing.T) {
 // Ensure the handler can parse chunked and chunk size query parameters.
 func TestHandler_Query_Chunked(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if ctx.ChunkSize != 2 {
 			t.Fatalf("unexpected chunk size: %d", ctx.ChunkSize)
 		}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		return nil
 	}
 
@@ -285,14 +315,14 @@ func TestHandler_Query_Chunked(t *testing.T) {
 func TestHandler_Query_Async(t *testing.T) {
 	done := make(chan struct{})
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		if stmt.String() != `SELECT * FROM bar` {
 			t.Fatalf("unexpected query: %s", stmt.String())
 		} else if ctx.Database != `foo` {
 			t.Fatalf("unexpected db: %s", ctx.Database)
 		}
-		ctx.Results <- &influxql.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
-		ctx.Results <- &influxql.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{{Name: "series0"}})}
+		ctx.Results <- &query.Result{StatementID: 2, Series: models.Rows([]*models.Row{{Name: "series1"}})}
 		close(done)
 		return nil
 	}
@@ -343,11 +373,11 @@ func TestHandler_Query_ErrInvalidQuery(t *testing.T) {
 // Ensure the handler returns an appropriate 401 or 403 status when authentication or authorization fails.
 func TestHandler_Query_ErrAuthorize(t *testing.T) {
 	h := NewHandler(true)
-	h.QueryAuthorizer.AuthorizeQueryFn = func(u *meta.UserInfo, q *influxql.Query, db string) error {
+	h.QueryAuthorizer.AuthorizeQueryFn = func(u meta.User, q *influxql.Query, db string) error {
 		return errors.New("marker")
 	}
 	h.MetaClient.AdminUserExistsFn = func() bool { return true }
-	h.MetaClient.AuthenticateFn = func(u, p string) (*meta.UserInfo, error) {
+	h.MetaClient.AuthenticateFn = func(u, p string) (meta.User, error) {
 
 		users := []meta.UserInfo{
 			{
@@ -419,7 +449,7 @@ func TestHandler_Query_ErrAuthorize(t *testing.T) {
 // Ensure the handler returns a status 200 if an error is returned in the result.
 func TestHandler_Query_ErrResult(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		return errors.New("measurement not found")
 	}
 
@@ -440,7 +470,7 @@ func TestHandler_Query_CloseNotify(t *testing.T) {
 
 	interrupted := make(chan struct{})
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		select {
 		case <-ctx.InterruptCh:
 		case <-done:
@@ -499,6 +529,137 @@ func TestHandler_Query_CloseNotify(t *testing.T) {
 	}
 }
 
+// Ensure the prometheus remote write works
+func TestHandler_PromWrite(t *testing.T) {
+	req := &remote.WriteRequest{
+		Timeseries: []*remote.TimeSeries{
+			{
+				Labels: []*remote.LabelPair{
+					{Name: "host", Value: "a"},
+					{Name: "region", Value: "west"},
+				},
+				Samples: []*remote.Sample{
+					{TimestampMs: 1, Value: 1.2},
+					{TimestampMs: 2, Value: math.NaN()},
+				},
+			},
+		},
+	}
+
+	data, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal("couldn't marshal prometheus request")
+	}
+	compressed := snappy.Encode(nil, data)
+
+	b := bytes.NewReader(compressed)
+	h := NewHandler(false)
+	h.MetaClient.DatabaseFn = func(name string) *meta.DatabaseInfo {
+		return &meta.DatabaseInfo{}
+	}
+	called := false
+	h.PointsWriter.WritePointsFn = func(db, rp string, _ models.ConsistencyLevel, _ meta.User, points []models.Point) error {
+		called = true
+		point := points[0]
+		if point.UnixNano() != int64(time.Millisecond) {
+			t.Fatalf("Exp point time %d but got %d", int64(time.Millisecond), point.UnixNano())
+		}
+		tags := point.Tags()
+		expectedTags := models.Tags{models.Tag{Key: []byte("host"), Value: []byte("a")}, models.Tag{Key: []byte("region"), Value: []byte("west")}}
+		if !reflect.DeepEqual(tags, expectedTags) {
+			t.Fatalf("tags don't match\n\texp: %v\n\tgot: %v", expectedTags, tags)
+		}
+
+		fields, err := point.Fields()
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		expFields := models.Fields{"f64": 1.2}
+		if !reflect.DeepEqual(fields, expFields) {
+			t.Fatalf("fields don't match\n\texp: %v\n\tgot: %v", expFields, fields)
+		}
+		return nil
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewRequest("POST", "/api/v1/prom/write?db=foo", b))
+	if !called {
+		t.Fatal("WritePoints: expected call")
+	}
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+// Ensure Prometheus remote read requests are converted to the correct InfluxQL query and
+// data is returned
+func TestHandler_PromRead(t *testing.T) {
+	req := &remote.ReadRequest{
+		Queries: []*remote.Query{{
+			Matchers: []*remote.LabelMatcher{
+				{Type: remote.MatchType_EQUAL, Name: "eq", Value: "a"},
+				{Type: remote.MatchType_NOT_EQUAL, Name: "neq", Value: "b"},
+				{Type: remote.MatchType_REGEX_MATCH, Name: "regex", Value: "c"},
+				{Type: remote.MatchType_REGEX_NO_MATCH, Name: "neqregex", Value: "d"},
+			},
+			StartTimestampMs: 1,
+			EndTimestampMs:   2,
+		}},
+	}
+	data, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal("couldn't marshal prometheus request")
+	}
+	compressed := snappy.Encode(nil, data)
+	b := bytes.NewReader(compressed)
+
+	h := NewHandler(false)
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
+		if stmt.String() != `SELECT f64 FROM foo.._ WHERE eq = 'a' AND neq != 'b' AND regex =~ 'c' AND neqregex !~ 'd' AND time >= '1970-01-01T00:00:00.001Z' AND time <= '1970-01-01T00:00:00.002Z' GROUP BY *` {
+			t.Fatalf("unexpected query: %s", stmt.String())
+		} else if ctx.Database != `foo` {
+			t.Fatalf("unexpected db: %s", ctx.Database)
+		}
+		row := &models.Row{
+			Name:    "_",
+			Tags:    map[string]string{"foo": "bar"},
+			Columns: []string{"time", "f64"},
+			Values:  [][]interface{}{{time.Unix(23, 0), 1.2}},
+		}
+		ctx.Results <- &query.Result{StatementID: 1, Series: models.Rows([]*models.Row{row})}
+		return nil
+	}
+
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, MustNewJSONRequest("POST", "/api/v1/prom/read?db=foo", b))
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+
+	reqBuf, err := snappy.Decode(nil, w.Body.Bytes())
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	var resp remote.ReadResponse
+	if err := proto.Unmarshal(reqBuf, &resp); err != nil {
+		t.Fatal(err.Error())
+	}
+
+	expLabels := []*remote.LabelPair{{Name: "foo", Value: "bar"}}
+	expSamples := []*remote.Sample{{TimestampMs: 23000, Value: 1.2}}
+
+	ts := resp.Results[0].Timeseries[0]
+
+	if !reflect.DeepEqual(expLabels, ts.Labels) {
+		t.Fatalf("unexpected labels\n\texp: %v\n\tgot: %v", expLabels, ts.Labels)
+	}
+	if !reflect.DeepEqual(expSamples, ts.Samples) {
+		t.Fatalf("unexpectd samples\n\texp: %v\n\tgot: %v", expSamples, ts.Samples)
+	}
+}
+
 // Ensure the handler handles ping requests correctly.
 // TODO: This should be expanded to verify the MetaClient check in servePing is working correctly
 func TestHandler_Ping(t *testing.T) {
@@ -517,7 +678,7 @@ func TestHandler_Ping(t *testing.T) {
 // Ensure the handler returns the version correctly from the different endpoints.
 func TestHandler_Version(t *testing.T) {
 	h := NewHandler(false)
-	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+	h.StatementExecutor.ExecuteStatementFn = func(stmt influxql.Statement, ctx query.ExecutionContext) error {
 		return nil
 	}
 	tests := []struct {
@@ -550,12 +711,20 @@ func TestHandler_Version(t *testing.T) {
 	for _, test := range tests {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, MustNewRequest(test.method, test.endpoint, test.body))
-		if v, ok := w.HeaderMap["X-Influxdb-Version"]; ok {
+		if v := w.HeaderMap["X-Influxdb-Version"]; len(v) > 0 {
 			if v[0] != "0.0.0" {
 				t.Fatalf("unexpected version: %s", v)
 			}
 		} else {
 			t.Fatalf("Header entry 'X-Influxdb-Version' not present")
+		}
+
+		if v := w.HeaderMap["X-Influxdb-Build"]; len(v) > 0 {
+			if v[0] != "OSS" {
+				t.Fatalf("unexpected BuildType: %s", v)
+			}
+		} else {
+			t.Fatalf("Header entry 'X-Influxdb-Build' not present")
 		}
 	}
 }
@@ -585,6 +754,69 @@ func TestHandler_HandleBadRequestBody(t *testing.T) {
 	}
 }
 
+func TestHandler_Write_EntityTooLarge_ContentLength(t *testing.T) {
+	b := bytes.NewReader(make([]byte, 100))
+	h := NewHandler(false)
+	h.Config.MaxBodySize = 5
+	h.MetaClient.DatabaseFn = func(name string) *meta.DatabaseInfo {
+		return &meta.DatabaseInfo{}
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewRequest("POST", "/write?db=foo", b))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+// onlyReader implements io.Reader only to ensure Request.ContentLength is not set
+type onlyReader struct {
+	r io.Reader
+}
+
+func (o onlyReader) Read(p []byte) (n int, err error) {
+	return o.r.Read(p)
+}
+
+func TestHandler_Write_EntityTooLarge_NoContentLength(t *testing.T) {
+	b := onlyReader{bytes.NewReader(make([]byte, 100))}
+	h := NewHandler(false)
+	h.Config.MaxBodySize = 5
+	h.MetaClient.DatabaseFn = func(name string) *meta.DatabaseInfo {
+		return &meta.DatabaseInfo{}
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewRequest("POST", "/write?db=foo", b))
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
+// TestHandler_Write_NegativeMaxBodySize verifies no error occurs if MaxBodySize is < 0
+func TestHandler_Write_NegativeMaxBodySize(t *testing.T) {
+	b := bytes.NewReader([]byte(`foo n=1`))
+	h := NewHandler(false)
+	h.Config.MaxBodySize = -1
+	h.MetaClient.DatabaseFn = func(name string) *meta.DatabaseInfo {
+		return &meta.DatabaseInfo{}
+	}
+	called := false
+	h.PointsWriter.WritePointsFn = func(_, _ string, _ models.ConsistencyLevel, _ meta.User, _ []models.Point) error {
+		called = true
+		return nil
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, MustNewRequest("POST", "/write?db=foo", b))
+	if !called {
+		t.Fatal("WritePoints: expected call")
+	}
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", w.Code)
+	}
+}
+
 // Ensure X-Forwarded-For header writes the correct log message.
 func TestHandler_XForwardedFor(t *testing.T) {
 	var buf bytes.Buffer
@@ -602,12 +834,79 @@ func TestHandler_XForwardedFor(t *testing.T) {
 	}
 }
 
+func TestHandler_XRequestId(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewHandler(false)
+	h.CLFLogger = log.New(&buf, "", 0)
+
+	cases := []map[string]string{
+		{"X-Request-Id": "abc123", "Request-Id": ""},          // X-Request-Id is used.
+		{"X-REQUEST-ID": "cde", "Request-Id": ""},             // X-REQUEST-ID is used.
+		{"X-Request-Id": "", "Request-Id": "foobarzoo"},       // Request-Id is used.
+		{"X-Request-Id": "abc123", "Request-Id": "foobarzoo"}, // X-Request-Id takes precedence.
+		{"X-Request-Id": "", "Request-Id": ""},                // v1 UUID generated.
+	}
+
+	for _, c := range cases {
+		t.Run(fmt.Sprint(c), func(t *testing.T) {
+			buf.Reset()
+			req := MustNewRequest("GET", "/ping", nil)
+			req.RemoteAddr = "127.0.0.1"
+
+			// Set the relevant request ID headers
+			var allEmpty = true
+			for k, v := range c {
+				req.Header.Set(k, v)
+				if v != "" {
+					allEmpty = false
+				}
+			}
+
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			// Split up the HTTP log line. The request ID is currently located in
+			// index 12. If the log line gets changed in the future, this test
+			// will likely break and the index will need to be updated.
+			parts := strings.Split(buf.String(), " ")
+			i := 12
+
+			// If neither header is set then we expect a v1 UUID to be generated.
+			if allEmpty {
+				if got, exp := len(parts[i]), 36; got != exp {
+					t.Fatalf("got ID of length %d, expected one of length %d", got, exp)
+				}
+			} else if c["X-Request-Id"] != "" {
+				if got, exp := parts[i], c["X-Request-Id"]; got != exp {
+					t.Fatalf("got ID of %q, expected %q", got, exp)
+				}
+			} else if c["X-REQUEST-ID"] != "" {
+				if got, exp := parts[i], c["X-REQUEST-ID"]; got != exp {
+					t.Fatalf("got ID of %q, expected %q", got, exp)
+				}
+			} else {
+				if got, exp := parts[i], c["Request-Id"]; got != exp {
+					t.Fatalf("got ID of %q, expected %q", got, exp)
+				}
+			}
+
+			// Check response headers
+			if got, exp := w.Header().Get("Request-Id"), parts[i]; got != exp {
+				t.Fatalf("Request-Id header was %s, expected %s", got, exp)
+			} else if got, exp := w.Header().Get("X-Request-Id"), parts[i]; got != exp {
+				t.Fatalf("X-Request-Id header was %s, expected %s", got, exp)
+			}
+		})
+	}
+}
+
 // NewHandler represents a test wrapper for httpd.Handler.
 type Handler struct {
 	*httpd.Handler
-	MetaClient        HandlerMetaStore
+	MetaClient        *internal.MetaClientMock
 	StatementExecutor HandlerStatementExecutor
 	QueryAuthorizer   HandlerQueryAuthorizer
+	PointsWriter      HandlerPointsWriter
 }
 
 // NewHandler returns a new instance of Handler.
@@ -619,63 +918,43 @@ func NewHandler(requireAuthentication bool) *Handler {
 	h := &Handler{
 		Handler: httpd.NewHandler(config),
 	}
-	h.Handler.MetaClient = &h.MetaClient
-	h.Handler.QueryExecutor = influxql.NewQueryExecutor()
+
+	h.MetaClient = &internal.MetaClientMock{}
+
+	h.Handler.MetaClient = h.MetaClient
+	h.Handler.QueryExecutor = query.NewQueryExecutor()
 	h.Handler.QueryExecutor.StatementExecutor = &h.StatementExecutor
 	h.Handler.QueryAuthorizer = &h.QueryAuthorizer
+	h.Handler.PointsWriter = &h.PointsWriter
 	h.Handler.Version = "0.0.0"
+	h.Handler.BuildType = "OSS"
 	return h
-}
-
-// HandlerMetaStore is a mock implementation of Handler.MetaClient.
-type HandlerMetaStore struct {
-	PingFn            func(d time.Duration) error
-	DatabaseFn        func(name string) *meta.DatabaseInfo
-	AuthenticateFn    func(username, password string) (ui *meta.UserInfo, err error)
-	UserFn            func(username string) (*meta.UserInfo, error)
-	AdminUserExistsFn func() bool
-}
-
-func (s *HandlerMetaStore) Ping(b bool) error {
-	if s.PingFn == nil {
-		// Default behaviour is to assume there is a leader.
-		return nil
-	}
-	return s.Ping(b)
-}
-
-func (s *HandlerMetaStore) Database(name string) *meta.DatabaseInfo {
-	return s.DatabaseFn(name)
-}
-
-func (s *HandlerMetaStore) Authenticate(username, password string) (ui *meta.UserInfo, err error) {
-	return s.AuthenticateFn(username, password)
-}
-
-func (s *HandlerMetaStore) AdminUserExists() bool {
-	return s.AdminUserExistsFn()
-}
-
-func (s *HandlerMetaStore) User(username string) (*meta.UserInfo, error) {
-	return s.UserFn(username)
 }
 
 // HandlerStatementExecutor is a mock implementation of Handler.StatementExecutor.
 type HandlerStatementExecutor struct {
-	ExecuteStatementFn func(stmt influxql.Statement, ctx influxql.ExecutionContext) error
+	ExecuteStatementFn func(stmt influxql.Statement, ctx query.ExecutionContext) error
 }
 
-func (e *HandlerStatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+func (e *HandlerStatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx query.ExecutionContext) error {
 	return e.ExecuteStatementFn(stmt, ctx)
 }
 
 // HandlerQueryAuthorizer is a mock implementation of Handler.QueryAuthorizer.
 type HandlerQueryAuthorizer struct {
-	AuthorizeQueryFn func(u *meta.UserInfo, query *influxql.Query, database string) error
+	AuthorizeQueryFn func(u meta.User, query *influxql.Query, database string) error
 }
 
-func (a *HandlerQueryAuthorizer) AuthorizeQuery(u *meta.UserInfo, query *influxql.Query, database string) error {
+func (a *HandlerQueryAuthorizer) AuthorizeQuery(u meta.User, query *influxql.Query, database string) error {
 	return a.AuthorizeQueryFn(u, query, database)
+}
+
+type HandlerPointsWriter struct {
+	WritePointsFn func(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error
+}
+
+func (h *HandlerPointsWriter) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, user meta.User, points []models.Point) error {
+	return h.WritePointsFn(database, retentionPolicy, consistencyLevel, user, points)
 }
 
 // MustNewRequest returns a new HTTP request. Panic on error.

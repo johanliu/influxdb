@@ -25,17 +25,19 @@ import (
 	"github.com/influxdata/influxdb/pkg/escape"
 	"github.com/influxdata/influxdb/pkg/estimator"
 	"github.com/influxdata/influxdb/pkg/estimator/hll"
+	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/tsdb"
+	"github.com/uber-go/zap"
 )
 
 // IndexName is the name of this index.
 const IndexName = "inmem"
 
 func init() {
-	tsdb.NewInmemIndex = func(name string) (interface{}, error) { return NewIndex(), nil }
+	tsdb.NewInmemIndex = func(name string) (interface{}, error) { return NewIndex(name), nil }
 
-	tsdb.RegisterIndex(IndexName, func(id uint64, path string, opt tsdb.EngineOptions) tsdb.Index {
-		return NewShardIndex(id, path, opt)
+	tsdb.RegisterIndex(IndexName, func(id uint64, database, path string, opt tsdb.EngineOptions) tsdb.Index {
+		return NewShardIndex(id, database, path, opt)
 	})
 }
 
@@ -45,20 +47,23 @@ func init() {
 type Index struct {
 	mu sync.RWMutex
 
+	database string
+
 	// In-memory metadata index, built on load and updated when new series come in
-	measurements map[string]*tsdb.Measurement // measurement name to object and index
-	series       map[string]*tsdb.Series      // map series key to the Series object
-	lastID       uint64                       // last used series ID. They're in memory only for this shard
+	measurements map[string]*Measurement // measurement name to object and index
+	series       map[string]*Series      // map series key to the Series object
+	lastID       uint64                  // last used series ID. They're in memory only for this shard
 
 	seriesSketch, seriesTSSketch             *hll.Plus
 	measurementsSketch, measurementsTSSketch *hll.Plus
 }
 
 // NewIndex returns a new initialized Index.
-func NewIndex() *Index {
+func NewIndex(database string) *Index {
 	index := &Index{
-		measurements: make(map[string]*tsdb.Measurement),
-		series:       make(map[string]*tsdb.Series),
+		database:     database,
+		measurements: make(map[string]*Measurement),
+		series:       make(map[string]*Series),
 	}
 
 	index.seriesSketch = hll.NewDefaultPlus()
@@ -73,8 +78,10 @@ func (i *Index) Type() string      { return IndexName }
 func (i *Index) Open() (err error) { return nil }
 func (i *Index) Close() error      { return nil }
 
+func (i *Index) WithLogger(zap.Logger) {}
+
 // Series returns a series by key.
-func (i *Index) Series(key []byte) (*tsdb.Series, error) {
+func (i *Index) Series(key []byte) (*Series, error) {
 	i.mu.RLock()
 	s := i.series[string(key)]
 	i.mu.RUnlock()
@@ -99,7 +106,7 @@ func (i *Index) SeriesN() int64 {
 }
 
 // Measurement returns the measurement object from the index by the name
-func (i *Index) Measurement(name []byte) (*tsdb.Measurement, error) {
+func (i *Index) Measurement(name []byte) (*Measurement, error) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.measurements[string(name)], nil
@@ -120,11 +127,11 @@ func (i *Index) MeasurementsSketches() (estimator.Sketch, estimator.Sketch, erro
 }
 
 // MeasurementsByName returns a list of measurements.
-func (i *Index) MeasurementsByName(names [][]byte) ([]*tsdb.Measurement, error) {
+func (i *Index) MeasurementsByName(names [][]byte) ([]*Measurement, error) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
-	a := make([]*tsdb.Measurement, 0, len(names))
+	a := make([]*Measurement, 0, len(names))
 	for _, name := range names {
 		if m := i.measurements[string(name)]; m != nil {
 			a = append(a, m)
@@ -150,10 +157,11 @@ func (i *Index) CreateSeriesIfNotExists(shardID uint64, key, name []byte, tags m
 	m := i.CreateMeasurementIndexIfNotExists(name)
 
 	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	// Check for the series again under a write lock
 	ss = i.series[string(key)]
 	if ss != nil {
-		i.mu.Unlock()
 		ss.AssignShard(shardID)
 		return nil
 	}
@@ -161,14 +169,13 @@ func (i *Index) CreateSeriesIfNotExists(shardID uint64, key, name []byte, tags m
 	// Verify that the series will not exceed limit.
 	if !ignoreLimits {
 		if max := opt.Config.MaxSeriesPerDatabase; max > 0 && len(i.series)+1 > max {
-			i.mu.Unlock()
 			return errMaxSeriesPerDatabaseExceeded
 		}
 	}
 
 	// set the in memory ID for query processing on this shard
 	// The series key and tags are clone to prevent a memory leak
-	series := tsdb.NewSeries([]byte(string(key)), tags.Clone())
+	series := NewSeries([]byte(string(key)), tags.Clone())
 	series.ID = i.lastID + 1
 	i.lastID++
 
@@ -180,14 +187,13 @@ func (i *Index) CreateSeriesIfNotExists(shardID uint64, key, name []byte, tags m
 
 	// Add the series to the series sketch.
 	i.seriesSketch.Add(key)
-	i.mu.Unlock()
 
 	return nil
 }
 
 // CreateMeasurementIndexIfNotExists creates or retrieves an in memory index
 // object for the measurement
-func (i *Index) CreateMeasurementIndexIfNotExists(name []byte) *tsdb.Measurement {
+func (i *Index) CreateMeasurementIndexIfNotExists(name []byte) *Measurement {
 	name = escape.Unescape(name)
 
 	// See if the measurement exists using a read-lock
@@ -207,7 +213,7 @@ func (i *Index) CreateMeasurementIndexIfNotExists(name []byte) *tsdb.Measurement
 	// and acquire the write lock
 	m = i.measurements[string(name)]
 	if m == nil {
-		m = tsdb.NewMeasurement(string(name))
+		m = NewMeasurement(i.database, string(name))
 		i.measurements[string(name)] = m
 
 		// Add the measurement to the measurements sketch.
@@ -219,9 +225,9 @@ func (i *Index) CreateMeasurementIndexIfNotExists(name []byte) *tsdb.Measurement
 // HasTagKey returns true if tag key exists.
 func (i *Index) HasTagKey(name, key []byte) (bool, error) {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	mm := i.measurements[string(name)]
+	i.mu.RUnlock()
+
 	if mm == nil {
 		return false, nil
 	}
@@ -243,9 +249,9 @@ func (i *Index) HasTagValue(name, key, value []byte) bool {
 // TagValueN returns the cardinality of a tag value.
 func (i *Index) TagValueN(name, key []byte) int {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	mm := i.measurements[string(name)]
+	i.mu.RUnlock()
+
 	if mm == nil {
 		return 0
 	}
@@ -255,13 +261,81 @@ func (i *Index) TagValueN(name, key []byte) int {
 // MeasurementTagKeysByExpr returns an ordered set of tag keys filtered by an expression.
 func (i *Index) MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[string]struct{}, error) {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	mm := i.measurements[string(name)]
+	i.mu.RUnlock()
+
 	if mm == nil {
 		return nil, nil
 	}
 	return mm.TagKeysByExpr(expr)
+}
+
+// MeasurementTagKeyValuesByExpr returns a set of tag values filtered by an expression.
+//
+// See tsm1.Engine.MeasurementTagKeyValuesByExpr for a fuller description of this
+// method.
+func (i *Index) MeasurementTagKeyValuesByExpr(name []byte, keys []string, expr influxql.Expr, keysSorted bool) ([][]string, error) {
+	i.mu.RLock()
+	mm := i.measurements[string(name)]
+	i.mu.RUnlock()
+
+	if mm == nil || len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]string, len(keys))
+
+	// If we haven't been provided sorted keys, then we need to sort them.
+	if !keysSorted {
+		sort.Sort(sort.StringSlice(keys))
+	}
+
+	ids, _, _ := mm.WalkWhereForSeriesIds(expr)
+	if ids.Len() == 0 && expr == nil {
+		for ki, key := range keys {
+			values := mm.TagValues(key)
+			sort.Sort(sort.StringSlice(values))
+			results[ki] = values
+		}
+		return results, nil
+	}
+
+	// This is the case where we have filtered series by some WHERE condition.
+	// We only care about the tag values for the keys given the
+	// filtered set of series ids.
+
+	keyIdxs := make(map[string]int, len(keys))
+	for ki, key := range keys {
+		keyIdxs[key] = ki
+	}
+
+	resultSet := make([]stringSet, len(keys))
+	for i := 0; i < len(resultSet); i++ {
+		resultSet[i] = newStringSet()
+	}
+
+	// Iterate all series to collect tag values.
+	for _, id := range ids {
+		s := mm.SeriesByID(id)
+		if s == nil {
+			continue
+		}
+
+		// Iterate the tag keys we're interested in and collect values
+		// from this series, if they exist.
+		for _, t := range s.Tags() {
+			if idx, ok := keyIdxs[string(t.Key)]; ok {
+				resultSet[idx].add(string(t.Value))
+			} else if string(t.Key) > keys[len(keys)-1] {
+				// The tag key is > the largest key we're interested in.
+				break
+			}
+		}
+	}
+	for i, s := range resultSet {
+		results[i] = s.list()
+	}
+	return results, nil
 }
 
 // ForEachMeasurementTagKey iterates over all tag keys for a measurement.
@@ -289,9 +363,9 @@ func (i *Index) ForEachMeasurementTagKey(name []byte, fn func(key []byte) error)
 // TagKeyCardinality returns the number of values for a measurement/tag key.
 func (i *Index) TagKeyCardinality(name, key []byte) int {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	mm := i.measurements[string(name)]
+	i.mu.RUnlock()
+
 	if mm == nil {
 		return 0
 	}
@@ -301,9 +375,9 @@ func (i *Index) TagKeyCardinality(name, key []byte) int {
 // TagsForSeries returns the tag map for the passed in series
 func (i *Index) TagsForSeries(key string) (models.Tags, error) {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	ss := i.series[key]
+	i.mu.RUnlock()
+
 	if ss == nil {
 		return nil, nil
 	}
@@ -343,7 +417,7 @@ func (i *Index) measurementNamesByExpr(expr influxql.Expr) ([][]byte, error) {
 				return nil, fmt.Errorf("left side of '%s' must be a tag key", e.Op.String())
 			}
 
-			tf := &tsdb.TagFilter{
+			tf := &TagFilter{
 				Op:  e.Op,
 				Key: tag.Val,
 			}
@@ -420,7 +494,7 @@ func (i *Index) measurementNamesByNameFilter(op influxql.Token, val string, rege
 }
 
 // measurementNamesByTagFilters returns the sorted measurements matching the filters on tag values.
-func (i *Index) measurementNamesByTagFilters(filter *tsdb.TagFilter) [][]byte {
+func (i *Index) measurementNamesByTagFilters(filter *TagFilter) [][]byte {
 	// Build a list of measurements matching the filters.
 	var names [][]byte
 	var tagMatch bool
@@ -515,10 +589,11 @@ func (i *Index) DropSeries(key []byte) error {
 	}
 
 	i.mu.Lock()
+	defer i.mu.Unlock()
+
 	k := string(key)
 	series := i.series[k]
 	if series == nil {
-		i.mu.Unlock()
 		return nil
 	}
 
@@ -535,30 +610,12 @@ func (i *Index) DropSeries(key []byte) error {
 	if !series.Measurement().HasSeries() {
 		i.dropMeasurement(series.Measurement().Name)
 	}
-	i.mu.Unlock()
-
-	return nil
-}
-
-// ForEachMeasurementSeriesByExpr iterates over all series in a measurement filtered by an expression.
-func (i *Index) ForEachMeasurementSeriesByExpr(name []byte, expr influxql.Expr, fn func(tags models.Tags) error) error {
-	i.mu.RLock()
-	mm := i.measurements[string(name)]
-	i.mu.RUnlock()
-
-	if mm == nil {
-		return nil
-	}
-
-	if err := mm.ForEachSeriesByExpr(expr, fn); err != nil {
-		return err
-	}
 
 	return nil
 }
 
 // TagSets returns a list of tag sets.
-func (i *Index) TagSets(shardID uint64, name []byte, opt influxql.IteratorOptions) ([]*influxql.TagSet, error) {
+func (i *Index) TagSets(shardID uint64, name []byte, opt query.IteratorOptions) ([]*query.TagSet, error) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
@@ -599,7 +656,7 @@ func (i *Index) ForEachMeasurementName(fn func(name []byte) error) error {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 
-	mms := make(tsdb.Measurements, 0, len(i.measurements))
+	mms := make(Measurements, 0, len(i.measurements))
 	for _, m := range i.measurements {
 		mms = append(mms, m)
 	}
@@ -647,17 +704,18 @@ func (i *Index) MeasurementSeriesKeysByExpr(name []byte, condition influxql.Expr
 }
 
 // SeriesPointIterator returns an influxql iterator over all series.
-func (i *Index) SeriesPointIterator(opt influxql.IteratorOptions) (influxql.Iterator, error) {
+func (i *Index) SeriesPointIterator(opt query.IteratorOptions) (query.Iterator, error) {
 	// Read and sort all measurements.
-	mms := make(tsdb.Measurements, 0, len(i.measurements))
+	mms := make(Measurements, 0, len(i.measurements))
 	for _, mm := range i.measurements {
 		mms = append(mms, mm)
 	}
 	sort.Sort(mms)
 
 	return &seriesPointIterator{
-		mms: mms,
-		point: influxql.FloatPoint{
+		database: i.database,
+		mms:      mms,
+		point: query.FloatPoint{
 			Aux: make([]interface{}, len(opt.Aux)),
 		},
 		opt: opt,
@@ -709,7 +767,7 @@ func (i *Index) assignExistingSeries(shardID uint64, keys, names [][]byte, tagsS
 	i.mu.RLock()
 	var n int
 	for j, key := range keys {
-		if ss, ok := i.series[string(key)]; !ok {
+		if ss := i.series[string(key)]; ss == nil {
 			keys[n] = keys[j]
 			names[n] = names[j]
 			tagsSlice[n] = tagsSlice[j]
@@ -823,12 +881,12 @@ func (i *ShardIndex) CreateSeriesIfNotExists(key, name []byte, tags models.Tags)
 }
 
 // TagSets returns a list of tag sets based on series filtering.
-func (i *ShardIndex) TagSets(name []byte, opt influxql.IteratorOptions) ([]*influxql.TagSet, error) {
+func (i *ShardIndex) TagSets(name []byte, opt query.IteratorOptions) ([]*query.TagSet, error) {
 	return i.Index.TagSets(i.id, name, opt)
 }
 
 // NewShardIndex returns a new index for a shard.
-func NewShardIndex(id uint64, path string, opt tsdb.EngineOptions) tsdb.Index {
+func NewShardIndex(id uint64, database, path string, opt tsdb.EngineOptions) tsdb.Index {
 	return &ShardIndex{
 		Index: opt.InmemIndex.(*Index),
 		id:    id,
@@ -838,24 +896,25 @@ func NewShardIndex(id uint64, path string, opt tsdb.EngineOptions) tsdb.Index {
 
 // seriesPointIterator emits series as influxql points.
 type seriesPointIterator struct {
-	mms  tsdb.Measurements
-	keys struct {
-		buf []string
+	database string
+	mms      Measurements
+	keys     struct {
+		buf []*Series
 		i   int
 	}
 
-	point influxql.FloatPoint // reusable point
-	opt   influxql.IteratorOptions
+	point query.FloatPoint // reusable point
+	opt   query.IteratorOptions
 }
 
 // Stats returns stats about the points processed.
-func (itr *seriesPointIterator) Stats() influxql.IteratorStats { return influxql.IteratorStats{} }
+func (itr *seriesPointIterator) Stats() query.IteratorStats { return query.IteratorStats{} }
 
 // Close closes the iterator.
 func (itr *seriesPointIterator) Close() error { return nil }
 
 // Next emits the next point in the iterator.
-func (itr *seriesPointIterator) Next() (*influxql.FloatPoint, error) {
+func (itr *seriesPointIterator) Next() (*query.FloatPoint, error) {
 	for {
 		// Load next measurement's keys if there are no more remaining.
 		if itr.keys.i >= len(itr.keys.buf) {
@@ -868,14 +927,18 @@ func (itr *seriesPointIterator) Next() (*influxql.FloatPoint, error) {
 		}
 
 		// Read the next key.
-		key := itr.keys.buf[itr.keys.i]
+		series := itr.keys.buf[itr.keys.i]
 		itr.keys.i++
+
+		if !itr.opt.Authorizer.AuthorizeSeriesRead(itr.database, series.measurement.name, series.tags) {
+			continue
+		}
 
 		// Write auxiliary fields.
 		for i, f := range itr.opt.Aux {
 			switch f.Val {
 			case "key":
-				itr.point.Aux[i] = key
+				itr.point.Aux[i] = series.Key
 			}
 		}
 		return &itr.point, nil
@@ -902,8 +965,12 @@ func (itr *seriesPointIterator) nextKeys() error {
 		} else if len(ids) == 0 {
 			continue
 		}
-		itr.keys.buf = mm.AppendSeriesKeysByID(itr.keys.buf, ids)
-		sort.Strings(itr.keys.buf)
+		itr.keys.buf = mm.SeriesByIDSlice(ids)
+
+		// Sort series by key
+		sort.Slice(itr.keys.buf, func(i, j int) bool {
+			return itr.keys.buf[i].Key < itr.keys.buf[j].Key
+		})
 
 		return nil
 	}

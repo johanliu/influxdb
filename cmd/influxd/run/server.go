@@ -13,9 +13,9 @@ import (
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/coordinator"
-	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor"
+	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/services/collectd"
 	"github.com/influxdata/influxdb/services/continuous_querier"
 	"github.com/influxdata/influxdb/services/graphite"
@@ -68,7 +68,7 @@ type Server struct {
 	MetaClient *meta.Client
 
 	TSDBStore     *tsdb.Store
-	QueryExecutor *influxql.QueryExecutor
+	QueryExecutor *query.QueryExecutor
 	PointsWriter  *coordinator.PointsWriter
 	Subscriber    *subscriber.Service
 
@@ -177,10 +177,9 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	s.PointsWriter = coordinator.NewPointsWriter()
 	s.PointsWriter.WriteTimeout = time.Duration(c.Coordinator.WriteTimeout)
 	s.PointsWriter.TSDBStore = s.TSDBStore
-	s.PointsWriter.Subscriber = s.Subscriber
 
 	// Initialize query executor.
-	s.QueryExecutor = influxql.NewQueryExecutor()
+	s.QueryExecutor = query.NewQueryExecutor()
 	s.QueryExecutor.StatementExecutor = &coordinator.StatementExecutor{
 		MetaClient:  s.MetaClient,
 		TaskManager: s.QueryExecutor.TaskManager,
@@ -263,6 +262,7 @@ func (s *Server) appendHTTPDService(c httpd.Config) {
 	srv.Handler.Monitor = s.Monitor
 	srv.Handler.PointsWriter = s.PointsWriter
 	srv.Handler.Version = s.buildInfo.Version
+	srv.Handler.BuildType = "OSS"
 
 	s.Services = append(s.Services, srv)
 }
@@ -338,6 +338,7 @@ func (s *Server) appendContinuousQueryService(c continuous_querier.Config) {
 	srv := continuous_querier.NewService(c)
 	srv.MetaClient = s.MetaClient
 	srv.QueryExecutor = s.QueryExecutor
+	srv.Monitor = s.Monitor
 	s.Services = append(s.Services, srv)
 }
 
@@ -385,7 +386,6 @@ func (s *Server) Open() error {
 	}
 
 	s.Subscriber.MetaClient = s.MetaClient
-	s.Subscriber.MetaClient = s.MetaClient
 	s.PointsWriter.MetaClient = s.MetaClient
 	s.Monitor.MetaClient = s.MetaClient
 
@@ -421,6 +421,8 @@ func (s *Server) Open() error {
 	if err := s.PointsWriter.Open(); err != nil {
 		return fmt.Errorf("open points writer: %s", err)
 	}
+
+	s.PointsWriter.AddWriteSubscriber(s.Subscriber.Points())
 
 	for _, service := range s.Services {
 		if err := service.Open(); err != nil {
@@ -602,7 +604,7 @@ func stopProfile() {
 type monitorPointsWriter coordinator.PointsWriter
 
 func (pw *monitorPointsWriter) WritePoints(database, retentionPolicy string, points models.Points) error {
-	return (*coordinator.PointsWriter)(pw).WritePoints(database, retentionPolicy, models.ConsistencyLevelAny, points)
+	return (*coordinator.PointsWriter)(pw).WritePointsPrivileged(database, retentionPolicy, models.ConsistencyLevelAny, points)
 }
 
 func raftDBExists(dir string) error {
