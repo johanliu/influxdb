@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -35,6 +36,9 @@ var (
 
 	// ErrQueryTimeoutLimitExceeded is an error when a query hits the max time allowed to run.
 	ErrQueryTimeoutLimitExceeded = errors.New("query-timeout limit exceeded")
+
+	// ErrAlreadyKilled is returned when attempting to kill a query that has already been killed.
+	ErrAlreadyKilled = errors.New("already killed")
 )
 
 // Statistics for the QueryExecutor
@@ -171,6 +175,26 @@ func (ctx *ExecutionContext) Send(result *Result) error {
 	return nil
 }
 
+type contextKey int
+
+const (
+	iteratorsContextKey contextKey = iota
+)
+
+// NewContextWithIterators returns a new context.Context with the *Iterators slice added.
+// The query planner will add instances of AuxIterator to the Iterators slice.
+func NewContextWithIterators(ctx context.Context, itr *Iterators) context.Context {
+	return context.WithValue(ctx, iteratorsContextKey, itr)
+}
+
+// tryAddAuxIteratorToContext will capture itr in the *Iterators slice, when configured
+// with a call to NewContextWithIterators.
+func tryAddAuxIteratorToContext(ctx context.Context, itr AuxIterator) {
+	if v, ok := ctx.Value(iteratorsContextKey).(*Iterators); ok {
+		*v = append(*v, itr)
+	}
+}
+
 // StatementExecutor executes a statement within the QueryExecutor.
 type StatementExecutor interface {
 	// ExecuteStatement executes a statement. Results should be sent to the
@@ -273,7 +297,7 @@ func (e *QueryExecutor) executeQuery(query *influxql.Query, opt ExecutionOptions
 		}
 		return
 	}
-	defer e.TaskManager.KillQuery(qid)
+	defer e.TaskManager.DetachQuery(qid)
 
 	// Setup the execution context that will be used when executing statements.
 	ctx := ExecutionContext{
@@ -441,6 +465,7 @@ type QueryMonitorFunc func(<-chan struct{}) error
 type QueryTask struct {
 	query     string
 	database  string
+	status    TaskStatus
 	startTime time.Time
 	closing   chan struct{}
 	monitorCh chan error
@@ -477,4 +502,25 @@ func (q *QueryTask) monitor(fn QueryMonitorFunc) {
 		case q.monitorCh <- err:
 		}
 	}
+}
+
+// close closes the query task closing channel if the query hasn't been previously killed.
+func (q *QueryTask) close() {
+	q.mu.Lock()
+	if q.status != KilledTask {
+		close(q.closing)
+	}
+	q.mu.Unlock()
+}
+
+func (q *QueryTask) kill() error {
+	q.mu.Lock()
+	if q.status == KilledTask {
+		q.mu.Unlock()
+		return ErrAlreadyKilled
+	}
+	q.status = KilledTask
+	close(q.closing)
+	q.mu.Unlock()
+	return nil
 }

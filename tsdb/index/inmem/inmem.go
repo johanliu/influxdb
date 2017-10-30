@@ -56,6 +56,9 @@ type Index struct {
 
 	seriesSketch, seriesTSSketch             *hll.Plus
 	measurementsSketch, measurementsTSSketch *hll.Plus
+
+	// Mutex to control rebuilds of the index
+	rebuildQueue sync.Mutex
 }
 
 // NewIndex returns a new initialized Index.
@@ -274,7 +277,7 @@ func (i *Index) MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[s
 //
 // See tsm1.Engine.MeasurementTagKeyValuesByExpr for a fuller description of this
 // method.
-func (i *Index) MeasurementTagKeyValuesByExpr(name []byte, keys []string, expr influxql.Expr, keysSorted bool) ([][]string, error) {
+func (i *Index) MeasurementTagKeyValuesByExpr(auth query.Authorizer, name []byte, keys []string, expr influxql.Expr, keysSorted bool) ([][]string, error) {
 	i.mu.RLock()
 	mm := i.measurements[string(name)]
 	i.mu.RUnlock()
@@ -293,7 +296,7 @@ func (i *Index) MeasurementTagKeyValuesByExpr(name []byte, keys []string, expr i
 	ids, _, _ := mm.WalkWhereForSeriesIds(expr)
 	if ids.Len() == 0 && expr == nil {
 		for ki, key := range keys {
-			values := mm.TagValues(key)
+			values := mm.TagValues(auth, key)
 			sort.Sort(sort.StringSlice(values))
 			results[ki] = values
 		}
@@ -318,6 +321,9 @@ func (i *Index) MeasurementTagKeyValuesByExpr(name []byte, keys []string, expr i
 	for _, id := range ids {
 		s := mm.SeriesByID(id)
 		if s == nil {
+			continue
+		}
+		if auth != nil && !auth.AuthorizeSeriesRead(i.database, s.Measurement().name, s.Tags()) {
 			continue
 		}
 
@@ -510,18 +516,20 @@ func (i *Index) measurementNamesByTagFilters(filter *TagFilter) [][]byte {
 
 		// If the operator is non-regex, only check the specified value.
 		if filter.Op == influxql.EQ || filter.Op == influxql.NEQ {
-			if _, ok := tagVals[filter.Value]; ok {
+			if tagVals.Contains(filter.Value) {
 				tagMatch = true
 			}
 		} else {
 			// Else, the operator is a regex and we have to check all tag
 			// values against the regular expression.
-			for tagVal := range tagVals {
-				if filter.Regex.MatchString(tagVal) {
+			tagVals.Range(func(k string, _ SeriesIDs) bool {
+				if filter.Regex.MatchString(k) {
 					tagMatch = true
-					continue
 				}
-			}
+				// If a tag matches then the Range over remaining tags can be
+				// ceased.
+				return !tagMatch
+			})
 		}
 
 		//
@@ -606,6 +614,9 @@ func (i *Index) DropSeries(key []byte) error {
 	// Remove the measurement's reference.
 	series.Measurement().DropSeries(series)
 
+	// Mark the series as deleted.
+	series.Delete()
+
 	// If the measurement no longer has any series, remove it as well.
 	if !series.Measurement().HasSeries() {
 		i.dropMeasurement(series.Measurement().Name)
@@ -654,13 +665,12 @@ func (i *Index) SetFieldName(measurement []byte, name string) {
 // ForEachMeasurementName iterates over each measurement name.
 func (i *Index) ForEachMeasurementName(fn func(name []byte) error) error {
 	i.mu.RLock()
-	defer i.mu.RUnlock()
-
 	mms := make(Measurements, 0, len(i.measurements))
 	for _, m := range i.measurements {
 		mms = append(mms, m)
 	}
 	sort.Sort(mms)
+	i.mu.RUnlock()
 
 	for _, m := range mms {
 		if err := fn([]byte(m.Name)); err != nil {
@@ -750,6 +760,30 @@ func (i *Index) UnassignShard(k string, shardID uint64) error {
 		}
 	}
 	return nil
+}
+
+// Rebuild recreates the measurement indexes to allow deleted series to be removed
+// and garbage collected.
+func (i *Index) Rebuild() {
+	// Only allow one rebuild at a time.  This will cause all subsequent rebuilds
+	// to queue.  The measurement rebuild is idempotent and will not be rebuilt if
+	// it does not need to be.
+	i.rebuildQueue.Lock()
+	defer i.rebuildQueue.Unlock()
+
+	i.ForEachMeasurementName(func(name []byte) error {
+		// Measurement never returns an error
+		m, _ := i.Measurement(name)
+		if m == nil {
+			return nil
+		}
+
+		nm := m.Rebuild()
+		i.mu.Lock()
+		i.measurements[string(name)] = nm
+		i.mu.Unlock()
+		return nil
+	})
 }
 
 // RemoveShard removes all references to shardID from any series or measurements

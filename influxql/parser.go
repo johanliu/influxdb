@@ -899,13 +899,22 @@ func (p *Parser) parseDeleteStatement() (Statement, error) {
 // parseShowSeriesStatement parses a string and returns a Statement.
 // This function assumes the "SHOW SERIES" tokens have already been consumed.
 func (p *Parser) parseShowSeriesStatement() (Statement, error) {
-	stmt := &ShowSeriesStatement{}
-	var err error
+	var exactCardinality bool
+	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == EXACT {
+		exactCardinality = true
+	} else {
+		p.Unscan()
+	}
 
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == CARDINALITY {
-		return p.parseShowSeriesCardinalityStatement()
+		return p.parseShowSeriesCardinalityStatement(exactCardinality)
 	}
 	p.Unscan()
+
+	// Handle SHOW SERIES statments.
+
+	stmt := &ShowSeriesStatement{}
+	var err error
 
 	// Parse optional ON clause.
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == ON {
@@ -950,10 +959,11 @@ func (p *Parser) parseShowSeriesStatement() (Statement, error) {
 	return stmt, nil
 }
 
-// This function assumes the "SHOW SERIES CARDINALITY" tokens have already been consumed.
-func (p *Parser) parseShowSeriesCardinalityStatement() (Statement, error) {
+// This function assumes the "SHOW SERIES EXACT CARDINALITY" or the
+// "SHOW SERIES CARDINALITY" tokens have already been consumed.
+func (p *Parser) parseShowSeriesCardinalityStatement(exact bool) (Statement, error) {
 	var err error
-	stmt := &ShowSeriesCardinalityStatement{}
+	stmt := &ShowSeriesCardinalityStatement{Exact: exact}
 
 	// Parse optional ON clause.
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == ON {
@@ -993,9 +1003,16 @@ func (p *Parser) parseShowSeriesCardinalityStatement() (Statement, error) {
 	return stmt, nil
 }
 
-// This function assumes the "SHOW MEASUREMENT CARDINALITY" tokens have already been consumed.
-func (p *Parser) parseShowMeasurementCardinalityStatement() (Statement, error) {
-	stmt := &ShowMeasurementCardinalityStatement{}
+// This function assumes the "SHOW MEASUREMENT" tokens have already been consumed.
+func (p *Parser) parseShowMeasurementCardinalityStatement(exact bool) (Statement, error) {
+	stmt := &ShowMeasurementCardinalityStatement{Exact: exact}
+
+	if stmt.Exact {
+		// Parse remaining CARDINALITY token
+		if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
+			return nil, newParseError(tokstr(tok, lit), []string{"CARDINALITY"}, pos)
+		}
+	}
 
 	// Parse optional ON clause.
 	var err error
@@ -1125,19 +1142,24 @@ func (p *Parser) parseShowRetentionPoliciesStatement() (*ShowRetentionPoliciesSt
 	return stmt, nil
 }
 
-// parseShowTagKeyStatement parses a string and returns a Statement.
 // This function assumes the "SHOW TAG KEY" tokens have already been consumed.
-func (p *Parser) parseShowTagKeyStatement() (Statement, error) {
-	if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
-		return nil, newParseError(tokstr(tok, lit), []string{"CARDINALITY"}, pos)
-	}
-	return p.parseShowTagKeyCardinalityStatement()
-}
-
-// This function assumes the "SHOW TAG KEY CARDINALITY" tokens have already been consumed.
 func (p *Parser) parseShowTagKeyCardinalityStatement() (Statement, error) {
 	var err error
-	stmt := &ShowTagKeyCardinalityStatement{}
+	var exactCardinality bool
+	requiredTokens := []string{"EXACT", "CARDINALITY"}
+	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == EXACT {
+		exactCardinality = true
+		requiredTokens = requiredTokens[1:]
+	} else {
+		p.Unscan()
+	}
+
+	stmt := &ShowTagKeyCardinalityStatement{Exact: exactCardinality}
+
+	// Parse remaining CARDINALITY token
+	if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
+		return nil, newParseError(tokstr(tok, lit), requiredTokens, pos)
+	}
 
 	// Parse optional ON clause.
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == ON {
@@ -1242,8 +1264,10 @@ func (p *Parser) parseShowTagValuesStatement() (Statement, error) {
 	stmt := &ShowTagValuesStatement{}
 	var err error
 
-	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == CARDINALITY {
-		return p.parseShowTagValuesCardinalityStatement()
+	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == EXACT {
+		return p.parseShowTagValuesCardinalityStatement(true)
+	} else if tok == CARDINALITY {
+		return p.parseShowTagValuesCardinalityStatement(false)
 	}
 	p.Unscan()
 
@@ -1295,10 +1319,17 @@ func (p *Parser) parseShowTagValuesStatement() (Statement, error) {
 	return stmt, nil
 }
 
-// This function assumes the "SHOW TAG VALUES CARDINALITY" tokens have already been consumed.
-func (p *Parser) parseShowTagValuesCardinalityStatement() (Statement, error) {
+// This function assumes the "SHOW TAG VALUES" tokens have already been consumed.
+func (p *Parser) parseShowTagValuesCardinalityStatement(exact bool) (Statement, error) {
 	var err error
-	stmt := &ShowTagValuesCardinalityStatement{}
+	stmt := &ShowTagValuesCardinalityStatement{Exact: exact}
+
+	if stmt.Exact {
+		// Parse remaining CARDINALITY token
+		if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
+			return nil, newParseError(tokstr(tok, lit), []string{"CARDINALITY"}, pos)
+		}
+	}
 
 	// Parse optional ON clause.
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == ON {
@@ -1405,19 +1436,24 @@ func (p *Parser) parseShowSubscriptionsStatement() (*ShowSubscriptionsStatement,
 	return stmt, nil
 }
 
-// parseShowFieldKeyStatement parses a string and returns a Statement.
 // This function assumes the "SHOW FIELD KEY" tokens have already been consumed.
-func (p *Parser) parseShowFieldKeyStatement() (Statement, error) {
-	if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
-		return nil, newParseError(tokstr(tok, lit), []string{"CARDINALITY"}, pos)
-	}
-	return p.parseShowFieldKeyCardinalityStatement()
-}
-
-// This function assumes the "SHOW FIELD KEY CARDINALITY" tokens have already been consumed.
 func (p *Parser) parseShowFieldKeyCardinalityStatement() (Statement, error) {
 	var err error
-	stmt := &ShowFieldKeyCardinalityStatement{}
+	var exactCardinality bool
+	requiredTokens := []string{"EXACT", "CARDINALITY"}
+	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == EXACT {
+		exactCardinality = true
+		requiredTokens = requiredTokens[1:]
+	} else {
+		p.Unscan()
+	}
+
+	stmt := &ShowFieldKeyCardinalityStatement{Exact: exactCardinality}
+
+	// Parse remaining CARDINALITY token
+	if tok, pos, lit := p.ScanIgnoreWhitespace(); tok != CARDINALITY {
+		return nil, newParseError(tokstr(tok, lit), requiredTokens, pos)
+	}
 
 	// Parse optional ON clause.
 	if tok, _, _ := p.ScanIgnoreWhitespace(); tok == ON {
@@ -2462,12 +2498,14 @@ func (p *Parser) ParseVarRef() (*VarRef, error) {
 				dtype = Float
 			case "integer":
 				dtype = Integer
+			case "unsigned":
+				dtype = Unsigned
 			case "string":
 				dtype = String
 			case "boolean":
 				dtype = Boolean
 			default:
-				return nil, newParseError(tokstr(tok, lit), []string{"float", "integer", "string", "boolean", "field", "tag"}, pos)
+				return nil, newParseError(tokstr(tok, lit), []string{"float", "integer", "unsigned", "string", "boolean", "field", "tag"}, pos)
 			}
 		case FIELD:
 			dtype = AnyField
@@ -2601,6 +2639,11 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 	case INTEGER:
 		v, err := strconv.ParseInt(lit, 10, 64)
 		if err != nil {
+			// The literal may be too large to fit into an int64. If it is, use an unsigned integer.
+			// The check for negative numbers is handled somewhere else so this should always be a positive number.
+			if v, err := strconv.ParseUint(lit, 10, 64); err == nil {
+				return &UnsignedLiteral{Val: v}, nil
+			}
 			return nil, &ParseError{Message: "unable to parse integer", Pos: pos}
 		}
 		return &IntegerLiteral{Val: v}, nil
@@ -2677,6 +2720,16 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 				lit.Val *= float64(mul)
 			case *IntegerLiteral:
 				lit.Val *= int64(mul)
+			case *UnsignedLiteral:
+				if tok == SUB {
+					// Because of twos-complement integers and the method we parse, math.MinInt64 will be parsed
+					// as an UnsignedLiteral because it overflows an int64, but it fits into int64 if it were parsed
+					// as a negative number instead.
+					if lit.Val == uint64(math.MaxInt64+1) {
+						return &IntegerLiteral{Val: int64(-lit.Val)}, nil
+					}
+					return nil, fmt.Errorf("constant -%d underflows int64", lit.Val)
+				}
 			case *DurationLiteral:
 				lit.Val *= time.Duration(mul)
 			case *VarRef, *Call, *ParenExpr:

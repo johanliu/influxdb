@@ -2,6 +2,7 @@ package tsdb_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -353,7 +354,7 @@ func TestShards_CreateIterator(t *testing.T) {
 		shards := s.ShardGroup([]uint64{0, 1})
 
 		// Create iterator.
-		itr, err := shards.CreateIterator("cpu", query.IteratorOptions{
+		itr, err := shards.CreateIterator(context.Background(), "cpu", query.IteratorOptions{
 			Expr:       influxql.MustParseExpr(`value`),
 			Dimensions: []string{"host"},
 			Ascending:  true,
@@ -443,7 +444,7 @@ func TestStore_BackupRestoreShard(t *testing.T) {
 		}
 
 		// Read data from
-		itr, err := s0.Shard(100).CreateIterator("cpu", query.IteratorOptions{
+		itr, err := s0.Shard(100).CreateIterator(context.Background(), "cpu", query.IteratorOptions{
 			Expr:      influxql.MustParseExpr(`value`),
 			Ascending: true,
 			StartTime: influxql.MinTime,
@@ -938,7 +939,7 @@ func TestStore_TagValues(t *testing.T) {
 		for _, index := range tsdb.RegisteredIndexes() {
 			setup(index)
 			t.Run(example.Name+"_"+index, func(t *testing.T) {
-				got, err := s.TagValues("db0", example.Expr)
+				got, err := s.TagValues(nil, "db0", example.Expr)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1168,7 +1169,7 @@ func BenchmarkStore_TagValues(b *testing.B) {
 					}
 					b.Run("random_values="+fmt.Sprint(useRand == 1)+"_index="+index+"_"+cnd+"_"+bm.name, func(b *testing.B) {
 						for i := 0; i < b.N; i++ {
-							if tvResult, err = s.TagValues("db0", condition); err != nil {
+							if tvResult, err = s.TagValues(nil, "db0", condition); err != nil {
 								b.Fatal(err)
 							}
 						}

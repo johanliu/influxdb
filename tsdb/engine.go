@@ -1,6 +1,7 @@
 package tsdb
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -43,7 +44,8 @@ type Engine interface {
 	Restore(r io.Reader, basePath string) error
 	Import(r io.Reader, basePath string) error
 
-	CreateIterator(measurement string, opt query.IteratorOptions) (query.Iterator, error)
+	CreateIterator(ctx context.Context, measurement string, opt query.IteratorOptions) (query.Iterator, error)
+	CreateCursor(ctx context.Context, r *CursorRequest) (Cursor, error)
 	IteratorCost(measurement string, opt query.IteratorOptions) (query.IteratorCost, error)
 	WritePoints(points []models.Point) error
 
@@ -65,7 +67,7 @@ type Engine interface {
 	// TagKeys(name []byte) ([][]byte, error)
 	HasTagKey(name, key []byte) (bool, error)
 	MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[string]struct{}, error)
-	MeasurementTagKeyValuesByExpr(name []byte, key []string, expr influxql.Expr, keysSorted bool) ([][]string, error)
+	MeasurementTagKeyValuesByExpr(auth query.Authorizer, name []byte, key []string, expr influxql.Expr, keysSorted bool) ([][]string, error)
 	ForEachMeasurementTagKey(name []byte, fn func(key []byte) error) error
 	TagKeyCardinality(name, key []byte) int
 
@@ -78,6 +80,7 @@ type Engine interface {
 	LastModified() time.Time
 	DiskSize() int64
 	IsIdle() bool
+	Free() error
 
 	io.WriterTo
 }
@@ -143,10 +146,11 @@ func NewEngine(id uint64, i Index, database, path string, walPath string, option
 
 // EngineOptions represents the options used to initialize the engine.
 type EngineOptions struct {
-	EngineVersion     string
-	IndexVersion      string
-	ShardID           uint64
-	InmemIndex        interface{} // shared in-memory index
+	EngineVersion string
+	IndexVersion  string
+	ShardID       uint64
+	InmemIndex    interface{} // shared in-memory index
+
 	CompactionLimiter limiter.Fixed
 
 	Config Config

@@ -20,6 +20,7 @@ import (
 	"github.com/influxdata/influxdb/pkg/bytesutil"
 	"github.com/influxdata/influxdb/pkg/estimator"
 	"github.com/influxdata/influxdb/pkg/limiter"
+	"github.com/influxdata/influxdb/query"
 	"github.com/uber-go/zap"
 )
 
@@ -159,15 +160,23 @@ func (s *Store) loadShards() error {
 		err error
 	}
 
-	t := limiter.NewFixed(runtime.GOMAXPROCS(0))
-
 	// Setup a shared limiter for compactions
 	lim := s.EngineOptions.Config.MaxConcurrentCompactions
 	if lim == 0 {
+		lim = runtime.GOMAXPROCS(0) / 2 // Default to 50% of cores for compactions
+		if lim < 1 {
+			lim = 1
+		}
+	}
+
+	// Don't allow more compactions to run than cores.
+	if lim > runtime.GOMAXPROCS(0) {
 		lim = runtime.GOMAXPROCS(0)
 	}
+
 	s.EngineOptions.CompactionLimiter = limiter.NewFixed(lim)
 
+	t := limiter.NewFixed(runtime.GOMAXPROCS(0))
 	resC := make(chan *res)
 	var n int
 
@@ -269,7 +278,9 @@ func (s *Store) loadShards() error {
 	for _, sh := range s.shards {
 		sh.SetEnabled(true)
 		if sh.IsIdle() {
-			sh.SetCompactionsEnabled(false)
+			if err := sh.Free(); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -769,7 +780,7 @@ func (s *Store) BackupShard(id uint64, since time.Time, w io.Writer) error {
 		return err
 	}
 
-	return shard.engine.Backup(w, path, since)
+	return shard.Backup(w, path, since)
 }
 
 // RestoreShard restores a backup from r to a given shard.
@@ -866,7 +877,7 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 				names = append(names, source.(*influxql.Measurement).Name)
 			}
 		} else {
-			if err := sh.engine.ForEachMeasurementName(func(name []byte) error {
+			if err := sh.ForEachMeasurementName(func(name []byte) error {
 				names = append(names, string(name))
 				return nil
 			}); err != nil {
@@ -881,7 +892,7 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 		// Find matching series keys for each measurement.
 		var keys [][]byte
 		for _, name := range names {
-			a, err := sh.engine.MeasurementSeriesKeysByExpr([]byte(name), condition)
+			a, err := sh.MeasurementSeriesKeysByExpr([]byte(name), condition)
 			if err != nil {
 				return err
 			}
@@ -927,6 +938,12 @@ func (s *Store) WriteToShard(shardID uint64, points []models.Point) error {
 		return ErrShardNotFound
 	}
 	s.mu.RUnlock()
+
+	// Ensure snapshot compactions are enabled since the shard might have been cold
+	// and disabled by the monitor.
+	if sh.IsIdle() {
+		sh.SetCompactionsEnabled(true)
+	}
 
 	return sh.WritePoints(points)
 }
@@ -997,7 +1014,7 @@ func (a tagValuesSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a tagValuesSlice) Less(i, j int) bool { return bytes.Compare(a[i].name, a[j].name) == -1 }
 
 // TagValues returns the tag keys and values in the given database, matching the condition.
-func (s *Store) TagValues(database string, cond influxql.Expr) ([]TagValues, error) {
+func (s *Store) TagValues(auth query.Authorizer, database string, cond influxql.Expr) ([]TagValues, error) {
 	if cond == nil {
 		return nil, errors.New("a condition is required")
 	}
@@ -1069,7 +1086,7 @@ func (s *Store) TagValues(database string, cond influxql.Expr) ([]TagValues, err
 		// filter.
 		for _, name := range names {
 			// Determine a list of keys from condition.
-			keySet, err := sh.engine.MeasurementTagKeysByExpr(name, cond)
+			keySet, err := sh.MeasurementTagKeysByExpr(name, cond)
 			if err != nil {
 				return nil, err
 			}
@@ -1093,10 +1110,28 @@ func (s *Store) TagValues(database string, cond influxql.Expr) ([]TagValues, err
 			// get all the tag values for each key in the keyset.
 			// Each slice in the results contains the sorted values associated
 			// associated with each tag key for the measurement from the key set.
-			if result.values, err = sh.engine.MeasurementTagKeyValuesByExpr(name, result.keys, filterExpr, true); err != nil {
+			if result.values, err = sh.MeasurementTagKeyValuesByExpr(auth, name, result.keys, filterExpr, true); err != nil {
 				return nil, err
 			}
-			allResults = append(allResults, result)
+
+			// remove any tag keys that didn't have any authorized values
+			j := 0
+			for i := range result.keys {
+				if len(result.values[i]) == 0 {
+					continue
+				}
+
+				result.keys[j] = result.keys[i]
+				result.values[j] = result.values[i]
+				j++
+			}
+			result.keys = result.keys[:j]
+			result.values = result.values[:j]
+
+			// only include result if there are keys with values
+			if len(result.keys) > 0 {
+				allResults = append(allResults, result)
+			}
 		}
 	}
 
@@ -1256,7 +1291,9 @@ func (s *Store) monitorShards() {
 			s.mu.RLock()
 			for _, sh := range s.shards {
 				if sh.IsIdle() {
-					sh.SetCompactionsEnabled(false)
+					if err := sh.Free(); err != nil {
+						s.Logger.Warn("error free cold shard resources:", zap.Error(err))
+					}
 				} else {
 					sh.SetCompactionsEnabled(true)
 				}

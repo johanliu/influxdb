@@ -72,6 +72,8 @@ func InspectDataType(v interface{}) DataType {
 		return String
 	case bool:
 		return Boolean
+	case uint64:
+		return Unsigned
 	case time.Time:
 		return Time
 	case time.Duration:
@@ -88,7 +90,14 @@ func InspectDataType(v interface{}) DataType {
 // integers used decrease with higher precedence, but Unknown is the lowest
 // precedence at the zero value.
 func (d DataType) LessThan(other DataType) bool {
-	return d == Unknown || (other != Unknown && other < d)
+	if d == Unknown {
+		return true
+	} else if d == Unsigned {
+		return other != Unknown && other <= Integer
+	} else if other == Unsigned {
+		return d >= String
+	}
+	return other != Unknown && other < d
 }
 
 // String returns the human-readable string representation of the DataType.
@@ -98,6 +107,8 @@ func (d DataType) String() string {
 		return "float"
 	case Integer:
 		return "integer"
+	case Unsigned:
+		return "unsigned"
 	case String:
 		return "string"
 	case Boolean:
@@ -179,6 +190,7 @@ func (*Dimension) node()       {}
 func (Dimensions) node()       {}
 func (*DurationLiteral) node() {}
 func (*IntegerLiteral) node()  {}
+func (*UnsignedLiteral) node() {}
 func (*Field) node()           {}
 func (Fields) node()           {}
 func (*Measurement) node()     {}
@@ -312,6 +324,7 @@ func (*Call) expr()            {}
 func (*Distinct) expr()        {}
 func (*DurationLiteral) expr() {}
 func (*IntegerLiteral) expr()  {}
+func (*UnsignedLiteral) expr() {}
 func (*NilLiteral) expr()      {}
 func (*NumberLiteral) expr()   {}
 func (*ParenExpr) expr()       {}
@@ -333,6 +346,7 @@ type Literal interface {
 func (*BooleanLiteral) literal()  {}
 func (*DurationLiteral) literal() {}
 func (*IntegerLiteral) literal()  {}
+func (*UnsignedLiteral) literal() {}
 func (*NilLiteral) literal()      {}
 func (*NumberLiteral) literal()   {}
 func (*RegexLiteral) literal()    {}
@@ -1225,10 +1239,11 @@ func (s *SelectStatement) RewriteFields(m FieldMapper) (*SelectStatement, error)
 					continue
 				}
 
-				// All types that can expand wildcards support float and integer.
+				// All types that can expand wildcards support float, integer, and unsigned.
 				supportedTypes := map[DataType]struct{}{
-					Float:   struct{}{},
-					Integer: struct{}{},
+					Float:    {},
+					Integer:  {},
+					Unsigned: {},
 				}
 
 				// Add additional types for certain functions.
@@ -1238,6 +1253,8 @@ func (s *SelectStatement) RewriteFields(m FieldMapper) (*SelectStatement, error)
 					fallthrough
 				case "min", "max":
 					supportedTypes[Boolean] = struct{}{}
+				case "holt_winters", "holt_winters_with_fit":
+					delete(supportedTypes, Unsigned)
 				}
 
 				for _, ref := range fields {
@@ -2085,6 +2102,9 @@ type ShowSeriesCardinalityStatement struct {
 	// The database can also be specified per source in the Sources.
 	Database string
 
+	// Specifies whether the user requires exact counting or not.
+	Exact bool
+
 	// Measurement(s) the series are listed for.
 	Sources Sources
 
@@ -2100,12 +2120,18 @@ type ShowSeriesCardinalityStatement struct {
 // String returns a string representation of the show continuous queries statement.
 func (s *ShowSeriesCardinalityStatement) String() string {
 	var buf bytes.Buffer
-	_, _ = buf.WriteString("SHOW SERIES CARDINALITY")
+	_, _ = buf.WriteString("SHOW SERIES")
+
+	if s.Exact {
+		_, _ = buf.WriteString(" EXACT")
+	}
+	_, _ = buf.WriteString(" CARDINALITY")
 
 	if s.Database != "" {
 		_, _ = buf.WriteString(" ON ")
 		_, _ = buf.WriteString(QuoteIdent(s.Database))
 	}
+
 	if s.Sources != nil {
 		_, _ = buf.WriteString(" FROM ")
 		_, _ = buf.WriteString(s.Sources.String())
@@ -2130,6 +2156,9 @@ func (s *ShowSeriesCardinalityStatement) String() string {
 
 // RequiredPrivileges returns the privilege required to execute a ShowSeriesCardinalityStatement.
 func (s *ShowSeriesCardinalityStatement) RequiredPrivileges() (ExecutionPrivileges, error) {
+	if !s.Exact {
+		return ExecutionPrivileges{{Admin: false, Name: s.Database, Privilege: ReadPrivilege}}, nil
+	}
 	return s.Sources.RequiredPrivileges()
 }
 
@@ -2285,6 +2314,7 @@ func (s *DropContinuousQueryStatement) DefaultDatabase() string {
 
 // ShowMeasurementCardinalityStatement represents a command for listing measurement cardinality.
 type ShowMeasurementCardinalityStatement struct {
+	Exact         bool // If false then cardinality estimation will be used.
 	Database      string
 	Sources       Sources
 	Condition     Expr
@@ -2295,12 +2325,18 @@ type ShowMeasurementCardinalityStatement struct {
 // String returns a string representation of the statement.
 func (s *ShowMeasurementCardinalityStatement) String() string {
 	var buf bytes.Buffer
-	_, _ = buf.WriteString("SHOW MEASUREMENT CARDINALITY")
+	_, _ = buf.WriteString("SHOW MEASUREMENT")
+
+	if s.Exact {
+		_, _ = buf.WriteString(" EXACT")
+	}
+	_, _ = buf.WriteString(" CARDINALITY")
 
 	if s.Database != "" {
 		_, _ = buf.WriteString(" ON ")
 		_, _ = buf.WriteString(QuoteIdent(s.Database))
 	}
+
 	if s.Sources != nil {
 		_, _ = buf.WriteString(" FROM ")
 		_, _ = buf.WriteString(s.Sources.String())
@@ -2325,6 +2361,9 @@ func (s *ShowMeasurementCardinalityStatement) String() string {
 
 // RequiredPrivileges returns the privilege required to execute a ShowMeasurementCardinalityStatement.
 func (s *ShowMeasurementCardinalityStatement) RequiredPrivileges() (ExecutionPrivileges, error) {
+	if !s.Exact {
+		return ExecutionPrivileges{{Admin: false, Name: s.Database, Privilege: ReadPrivilege}}, nil
+	}
 	return s.Sources.RequiredPrivileges()
 }
 
@@ -2394,7 +2433,7 @@ func (s *ShowMeasurementsStatement) String() string {
 
 // RequiredPrivileges returns the privilege(s) required to execute a ShowMeasurementsStatement.
 func (s *ShowMeasurementsStatement) RequiredPrivileges() (ExecutionPrivileges, error) {
-	return ExecutionPrivileges{{Admin: false, Name: "", Privilege: ReadPrivilege}}, nil
+	return ExecutionPrivileges{{Admin: false, Name: s.Database, Privilege: ReadPrivilege}}, nil
 }
 
 // DefaultDatabase returns the default database from the statement.
@@ -2684,6 +2723,7 @@ func (s *ShowTagKeysStatement) DefaultDatabase() string {
 // ShowTagKeyCardinalityStatement represents a command for listing tag key cardinality.
 type ShowTagKeyCardinalityStatement struct {
 	Database      string
+	Exact         bool
 	Sources       Sources
 	Condition     Expr
 	Dimensions    Dimensions
@@ -2693,7 +2733,11 @@ type ShowTagKeyCardinalityStatement struct {
 // String returns a string representation of the statement.
 func (s *ShowTagKeyCardinalityStatement) String() string {
 	var buf bytes.Buffer
-	_, _ = buf.WriteString("SHOW TAG KEY CARDINALITY")
+	_, _ = buf.WriteString("SHOW TAG KEY ")
+	if s.Exact {
+		_, _ = buf.WriteString("EXACT ")
+	}
+	_, _ = buf.WriteString("CARDINALITY")
 
 	if s.Database != "" {
 		_, _ = buf.WriteString(" ON ")
@@ -2813,6 +2857,7 @@ func (s *ShowTagValuesStatement) DefaultDatabase() string {
 // ShowTagValuesCardinalityStatement represents a command for listing tag value cardinality.
 type ShowTagValuesCardinalityStatement struct {
 	Database      string
+	Exact         bool
 	Sources       Sources
 	Op            Token
 	TagKeyExpr    Literal
@@ -2824,7 +2869,11 @@ type ShowTagValuesCardinalityStatement struct {
 // String returns a string representation of the statement.
 func (s *ShowTagValuesCardinalityStatement) String() string {
 	var buf bytes.Buffer
-	_, _ = buf.WriteString("SHOW TAG VALUES CARDINALITY")
+	_, _ = buf.WriteString("SHOW TAG VALUES ")
+	if s.Exact {
+		_, _ = buf.WriteString("EXACT ")
+	}
+	_, _ = buf.WriteString("CARDINALITY")
 
 	if s.Database != "" {
 		_, _ = buf.WriteString(" ON ")
@@ -2886,6 +2935,7 @@ func (s *ShowUsersStatement) RequiredPrivileges() (ExecutionPrivileges, error) {
 // ShowFieldKeyCardinalityStatement represents a command for listing field key cardinality.
 type ShowFieldKeyCardinalityStatement struct {
 	Database      string
+	Exact         bool
 	Sources       Sources
 	Condition     Expr
 	Dimensions    Dimensions
@@ -2895,7 +2945,12 @@ type ShowFieldKeyCardinalityStatement struct {
 // String returns a string representation of the statement.
 func (s *ShowFieldKeyCardinalityStatement) String() string {
 	var buf bytes.Buffer
-	_, _ = buf.WriteString("SHOW FIELD KEY CARDINALITY")
+	_, _ = buf.WriteString("SHOW FIELD KEY ")
+
+	if s.Exact {
+		_, _ = buf.WriteString("EXACT ")
+	}
+	_, _ = buf.WriteString("CARDINALITY")
 
 	if s.Database != "" {
 		_, _ = buf.WriteString(" ON ")
@@ -3273,6 +3328,15 @@ type IntegerLiteral struct {
 // String returns a string representation of the literal.
 func (l *IntegerLiteral) String() string { return fmt.Sprintf("%d", l.Val) }
 
+// UnsignedLiteral represents an unsigned literal. The parser will only use an unsigned literal if the parsed
+// integer is greater than math.MaxInt64.
+type UnsignedLiteral struct {
+	Val uint64
+}
+
+// String returns a string representation of the literal.
+func (l *UnsignedLiteral) String() string { return strconv.FormatUint(l.Val, 10) }
+
 // BooleanLiteral represents a boolean literal.
 type BooleanLiteral struct {
 	Val bool
@@ -3494,6 +3558,8 @@ func CloneExpr(expr Expr) Expr {
 		return &DurationLiteral{Val: expr.Val}
 	case *IntegerLiteral:
 		return &IntegerLiteral{Val: expr.Val}
+	case *UnsignedLiteral:
+		return &UnsignedLiteral{Val: expr.Val}
 	case *NumberLiteral:
 		return &NumberLiteral{Val: expr.Val}
 	case *ParenExpr:
@@ -3794,6 +3860,8 @@ func Eval(expr Expr, m map[string]interface{}) interface{} {
 		return expr.Val
 	case *NumberLiteral:
 		return expr.Val
+	case *UnsignedLiteral:
+		return expr.Val
 	case *ParenExpr:
 		return Eval(expr.Expr, m)
 	case *RegexLiteral:
@@ -3844,12 +3912,14 @@ func evalBinaryExpr(expr *BinaryExpr, m map[string]interface{}) interface{} {
 			return ok && (lhs != rhs)
 		}
 	case float64:
-		// Try the rhs as a float64 or int64
+		// Try the rhs as a float64, int64, or uint64
 		rhsf, ok := rhs.(float64)
 		if !ok {
-			var rhsi int64
-			if rhsi, ok = rhs.(int64); ok {
-				rhsf = float64(rhsi)
+			switch val := rhs.(type) {
+			case int64:
+				rhsf, ok = float64(val), true
+			case uint64:
+				rhsf, ok = float64(val), true
 			}
 		}
 
@@ -3897,10 +3967,9 @@ func evalBinaryExpr(expr *BinaryExpr, m map[string]interface{}) interface{} {
 		}
 	case int64:
 		// Try as a float64 to see if a float cast is required.
-		rhsf, ok := rhs.(float64)
-		if ok {
+		switch rhs := rhs.(type) {
+		case float64:
 			lhs := float64(lhs)
-			rhs := rhsf
 			switch expr.Op {
 			case EQ:
 				return lhs == rhs
@@ -3928,64 +3997,209 @@ func evalBinaryExpr(expr *BinaryExpr, m map[string]interface{}) interface{} {
 			case MOD:
 				return math.Mod(lhs, rhs)
 			}
-		} else {
-			rhs, ok := rhs.(int64)
+		case int64:
 			switch expr.Op {
 			case EQ:
-				return ok && (lhs == rhs)
+				return lhs == rhs
 			case NEQ:
-				return ok && (lhs != rhs)
+				return lhs != rhs
 			case LT:
-				return ok && (lhs < rhs)
+				return lhs < rhs
 			case LTE:
-				return ok && (lhs <= rhs)
+				return lhs <= rhs
 			case GT:
-				return ok && (lhs > rhs)
+				return lhs > rhs
 			case GTE:
-				return ok && (lhs >= rhs)
+				return lhs >= rhs
 			case ADD:
-				if !ok {
-					return nil
-				}
 				return lhs + rhs
 			case SUB:
-				if !ok {
-					return nil
-				}
 				return lhs - rhs
 			case MUL:
-				if !ok {
-					return nil
-				}
 				return lhs * rhs
 			case DIV:
-				if !ok {
-					return nil
-				} else if rhs == 0 {
+				if rhs == 0 {
 					return float64(0)
 				}
 				return lhs / rhs
 			case MOD:
-				if !ok {
-					return nil
-				} else if rhs == 0 {
+				if rhs == 0 {
 					return int64(0)
 				}
 				return lhs % rhs
 			case BITWISE_AND:
-				if !ok {
-					return nil
-				}
 				return lhs & rhs
 			case BITWISE_OR:
-				if !ok {
-					return nil
-				}
 				return lhs | rhs
 			case BITWISE_XOR:
-				if !ok {
-					return nil
+				return lhs ^ rhs
+			}
+		case uint64:
+			switch expr.Op {
+			case EQ:
+				return uint64(lhs) == rhs
+			case NEQ:
+				return uint64(lhs) != rhs
+			case LT:
+				if lhs < 0 {
+					return true
 				}
+				return uint64(lhs) < rhs
+			case LTE:
+				if lhs < 0 {
+					return true
+				}
+				return uint64(lhs) <= rhs
+			case GT:
+				if lhs < 0 {
+					return false
+				}
+				return uint64(lhs) > rhs
+			case GTE:
+				if lhs < 0 {
+					return false
+				}
+				return uint64(lhs) >= rhs
+			case ADD:
+				return uint64(lhs) + rhs
+			case SUB:
+				return uint64(lhs) - rhs
+			case MUL:
+				return uint64(lhs) * rhs
+			case DIV:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return uint64(lhs) / rhs
+			case MOD:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return uint64(lhs) % rhs
+			case BITWISE_AND:
+				return uint64(lhs) & rhs
+			case BITWISE_OR:
+				return uint64(lhs) | rhs
+			case BITWISE_XOR:
+				return uint64(lhs) ^ rhs
+			}
+		}
+	case uint64:
+		// Try as a float64 to see if a float cast is required.
+		switch rhs := rhs.(type) {
+		case float64:
+			lhs := float64(lhs)
+			switch expr.Op {
+			case EQ:
+				return lhs == rhs
+			case NEQ:
+				return lhs != rhs
+			case LT:
+				return lhs < rhs
+			case LTE:
+				return lhs <= rhs
+			case GT:
+				return lhs > rhs
+			case GTE:
+				return lhs >= rhs
+			case ADD:
+				return lhs + rhs
+			case SUB:
+				return lhs - rhs
+			case MUL:
+				return lhs * rhs
+			case DIV:
+				if rhs == 0 {
+					return float64(0)
+				}
+				return lhs / rhs
+			case MOD:
+				return math.Mod(lhs, rhs)
+			}
+		case int64:
+			switch expr.Op {
+			case EQ:
+				return lhs == uint64(rhs)
+			case NEQ:
+				return lhs != uint64(rhs)
+			case LT:
+				if rhs < 0 {
+					return false
+				}
+				return lhs < uint64(rhs)
+			case LTE:
+				if rhs < 0 {
+					return false
+				}
+				return lhs <= uint64(rhs)
+			case GT:
+				if rhs < 0 {
+					return true
+				}
+				return lhs > uint64(rhs)
+			case GTE:
+				if rhs < 0 {
+					return true
+				}
+				return lhs >= uint64(rhs)
+			case ADD:
+				return lhs + uint64(rhs)
+			case SUB:
+				return lhs - uint64(rhs)
+			case MUL:
+				return lhs * uint64(rhs)
+			case DIV:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return lhs / uint64(rhs)
+			case MOD:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return lhs % uint64(rhs)
+			case BITWISE_AND:
+				return lhs & uint64(rhs)
+			case BITWISE_OR:
+				return lhs | uint64(rhs)
+			case BITWISE_XOR:
+				return lhs ^ uint64(rhs)
+			}
+		case uint64:
+			switch expr.Op {
+			case EQ:
+				return lhs == rhs
+			case NEQ:
+				return lhs != rhs
+			case LT:
+				return lhs < rhs
+			case LTE:
+				return lhs <= rhs
+			case GT:
+				return lhs > rhs
+			case GTE:
+				return lhs >= rhs
+			case ADD:
+				return lhs + rhs
+			case SUB:
+				return lhs - rhs
+			case MUL:
+				return lhs * rhs
+			case DIV:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return lhs / rhs
+			case MOD:
+				if rhs == 0 {
+					return uint64(0)
+				}
+				return lhs % rhs
+			case BITWISE_AND:
+				return lhs & rhs
+			case BITWISE_OR:
+				return lhs | rhs
+			case BITWISE_XOR:
 				return lhs ^ rhs
 			}
 		}
@@ -3994,28 +4208,35 @@ func evalBinaryExpr(expr *BinaryExpr, m map[string]interface{}) interface{} {
 		case EQ:
 			rhs, ok := rhs.(string)
 			if !ok {
-				return nil
+				return false
 			}
 			return lhs == rhs
 		case NEQ:
 			rhs, ok := rhs.(string)
 			if !ok {
-				return nil
+				return false
 			}
 			return lhs != rhs
 		case EQREGEX:
 			rhs, ok := rhs.(*regexp.Regexp)
 			if !ok {
-				return nil
+				return false
 			}
 			return rhs.MatchString(lhs)
 		case NEQREGEX:
 			rhs, ok := rhs.(*regexp.Regexp)
 			if !ok {
-				return nil
+				return false
 			}
 			return !rhs.MatchString(lhs)
 		}
+	}
+
+	// The types were not comparable. If our operation was an equality operation,
+	// return false instead of true.
+	switch expr.Op {
+	case EQ, NEQ, LT, LTE, GT, GTE:
+		return false
 	}
 	return nil
 }
@@ -4080,6 +4301,8 @@ func EvalType(expr Expr, sources Sources, typmap TypeMapper) DataType {
 			return Float
 		case "count":
 			return Integer
+		case "elapsed":
+			return Integer
 		default:
 			return EvalType(expr.Args[0], sources, typmap)
 		}
@@ -4089,6 +4312,8 @@ func EvalType(expr Expr, sources Sources, typmap TypeMapper) DataType {
 		return Float
 	case *IntegerLiteral:
 		return Integer
+	case *UnsignedLiteral:
+		return Unsigned
 	case *StringLiteral:
 		return String
 	case *BooleanLiteral:
@@ -4096,13 +4321,7 @@ func EvalType(expr Expr, sources Sources, typmap TypeMapper) DataType {
 	case *BinaryExpr:
 		lhs := EvalType(expr.LHS, sources, typmap)
 		rhs := EvalType(expr.RHS, sources, typmap)
-		if lhs != Unknown && rhs != Unknown {
-			if lhs < rhs {
-				return lhs
-			} else {
-				return rhs
-			}
-		} else if lhs != Unknown {
+		if rhs.LessThan(lhs) {
 			return lhs
 		} else {
 			return rhs
@@ -4124,7 +4343,7 @@ func FieldDimensions(sources Sources, m FieldMapper) (fields map[string]DataType
 			}
 
 			for k, typ := range f {
-				if _, ok := fields[k]; typ != Unknown && (!ok || typ < fields[k]) {
+				if fields[k].LessThan(typ) {
 					fields[k] = typ
 				}
 			}
@@ -4136,7 +4355,7 @@ func FieldDimensions(sources Sources, m FieldMapper) (fields map[string]DataType
 				k := f.Name()
 				typ := EvalType(f.Expr, src.Statement.Sources, m)
 
-				if _, ok := fields[k]; typ != Unknown && (!ok || typ < fields[k]) {
+				if fields[k].LessThan(typ) {
 					fields[k] = typ
 				}
 			}
@@ -4228,6 +4447,8 @@ func reduceBinaryExpr(expr *BinaryExpr, valuer Valuer) Expr {
 		return reduceBinaryExprDurationLHS(op, lhs, rhs, loc)
 	case *IntegerLiteral:
 		return reduceBinaryExprIntegerLHS(op, lhs, rhs, loc)
+	case *UnsignedLiteral:
+		return reduceBinaryExprUnsignedLHS(op, lhs, rhs)
 	case *NilLiteral:
 		return reduceBinaryExprNilLHS(op, lhs, rhs)
 	case *NumberLiteral:
@@ -4371,6 +4592,19 @@ func reduceBinaryExprIntegerLHS(op Token, lhs *IntegerLiteral, rhs Expr, loc *ti
 		case LTE:
 			return &BooleanLiteral{Val: lhs.Val <= rhs.Val}
 		}
+	case *UnsignedLiteral:
+		// Comparisons between an unsigned and integer literal will not involve
+		// a cast if the integer is negative as that will have an improper result.
+		// Look for those situations here.
+		if lhs.Val < 0 {
+			switch op {
+			case LT, LTE:
+				return &BooleanLiteral{Val: true}
+			case GT, GTE:
+				return &BooleanLiteral{Val: false}
+			}
+		}
+		return reduceBinaryExprUnsignedLHS(op, &UnsignedLiteral{Val: uint64(lhs.Val)}, rhs)
 	case *DurationLiteral:
 		// Treat the integer as a timestamp.
 		switch op {
@@ -4397,6 +4631,58 @@ func reduceBinaryExprIntegerLHS(op Token, lhs *IntegerLiteral, rhs Expr, loc *ti
 		}
 	case *NilLiteral:
 		return &BooleanLiteral{Val: false}
+	}
+	return &BinaryExpr{Op: op, LHS: lhs, RHS: rhs}
+}
+
+func reduceBinaryExprUnsignedLHS(op Token, lhs *UnsignedLiteral, rhs Expr) Expr {
+	switch rhs := rhs.(type) {
+	case *NumberLiteral:
+		return reduceBinaryExprNumberLHS(op, &NumberLiteral{Val: float64(lhs.Val)}, rhs)
+	case *IntegerLiteral:
+		// Comparisons between an unsigned and integer literal will not involve
+		// a cast if the integer is negative as that will have an improper result.
+		// Look for those situations here.
+		if rhs.Val < 0 {
+			switch op {
+			case LT, LTE:
+				return &BooleanLiteral{Val: false}
+			case GT, GTE:
+				return &BooleanLiteral{Val: true}
+			}
+		}
+		return reduceBinaryExprUnsignedLHS(op, lhs, &UnsignedLiteral{Val: uint64(rhs.Val)})
+	case *UnsignedLiteral:
+		switch op {
+		case ADD:
+			return &UnsignedLiteral{Val: lhs.Val + rhs.Val}
+		case SUB:
+			return &UnsignedLiteral{Val: lhs.Val - rhs.Val}
+		case MUL:
+			return &UnsignedLiteral{Val: lhs.Val * rhs.Val}
+		case DIV:
+			if rhs.Val == 0 {
+				return &UnsignedLiteral{Val: 0}
+			}
+			return &UnsignedLiteral{Val: lhs.Val / rhs.Val}
+		case MOD:
+			if rhs.Val == 0 {
+				return &UnsignedLiteral{Val: 0}
+			}
+			return &UnsignedLiteral{Val: lhs.Val % rhs.Val}
+		case EQ:
+			return &BooleanLiteral{Val: lhs.Val == rhs.Val}
+		case NEQ:
+			return &BooleanLiteral{Val: lhs.Val != rhs.Val}
+		case GT:
+			return &BooleanLiteral{Val: lhs.Val > rhs.Val}
+		case GTE:
+			return &BooleanLiteral{Val: lhs.Val >= rhs.Val}
+		case LT:
+			return &BooleanLiteral{Val: lhs.Val < rhs.Val}
+		case LTE:
+			return &BooleanLiteral{Val: lhs.Val <= rhs.Val}
+		}
 	}
 	return &BinaryExpr{Op: op, LHS: lhs, RHS: rhs}
 }
@@ -4467,6 +4753,8 @@ func reduceBinaryExprNumberLHS(op Token, lhs *NumberLiteral, rhs Expr) Expr {
 		case LTE:
 			return &BooleanLiteral{Val: lhs.Val <= float64(rhs.Val)}
 		}
+	case *UnsignedLiteral:
+		return reduceBinaryExprNumberLHS(op, lhs, &NumberLiteral{Val: float64(rhs.Val)})
 	case *NilLiteral:
 		return &BooleanLiteral{Val: false}
 	}
@@ -4836,11 +5124,8 @@ func ConditionExpr(cond Expr, valuer Valuer) (Expr, TimeRange, error) {
 				return nil, TimeRange{}, err
 			}
 
-			// If either of the two expressions has a time range and we are combining
-			// them with OR, return an error since this isn't allowed.
-			if cond.Op == OR && !(lhsTime.IsZero() && rhsTime.IsZero()) {
-				return nil, TimeRange{}, errors.New("cannot use OR with time conditions")
-			}
+			// Always intersect the time range even if it makes no sense.
+			// There is no such thing as using OR with a time range.
 			timeRange := lhsTime.Intersect(rhsTime)
 
 			// Combine the left and right expression.
